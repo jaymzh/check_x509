@@ -1,0 +1,741 @@
+#!/usr/bin/perl
+
+# -*- mode: perl; -*-
+# vim:textwidth=78:
+#
+# This is a generic PKI checking script. It was written to be easily plugged
+# into Nagios/NRPE/etc., but also to easily be usable from the command line,
+# in cron, or from other scripts/programs.
+#
+# It's config file is in YAML format which should be easy for both humans
+# and computers. Examples are included with the distribution.
+#
+# Copyright (c) 2007 Phil Dibowitz (phil@ipom.com)
+#
+#   This program is free software; you can redistribute it and/or
+#   modify it under the terms of the GNU General Public License as
+#   published by the Free Software Foundation, version 2.
+#
+# $Id$
+#
+
+use strict;
+use warnings;
+use Getopt::Long;
+use Crypt::X509;
+use Crypt::X509::CRL;
+use OpenCA::OpenSSL;
+use HTTP::Date;
+use File::Basename;
+use YAML::Syck;
+use Data::Dumper;
+
+use constant NAME => 'check_x509';
+use constant VERSION => '0.1';
+use constant DEFAULT_CONFIG => '/etc/check_x509.conf';
+use constant MONTHS => {
+	'Jan' => '01',
+	'Feb' => '02',
+	'Mar' => '03',
+	'Apr' => '04',
+	'May' => '05',
+	'Jun' => '06',
+	'Jul' => '07',
+	'Aug' => '08',
+	'Sep' => '09',
+	'Oct' => '10',
+	'Nov' => '11',
+	'Dec' => '12',
+};
+
+# seconds -> minutes/hours/days/weeks/years
+use constant MULTIPLIERS => {
+	'm' => 60,
+	'h' => 60 * 60,
+	'd' => 60 * 60 * 24,
+	'w' => 60 * 60 * 24 * 7,
+	'y' => 60 * 60 * 24 * 365,
+};
+
+# Formats
+use constant {
+	'FORMAT_PEM' => 0,
+	'FORMAT_DER' => 1,
+	'FORMAT_BUNDLE' => 2,
+};
+
+# Types
+use constant {
+	'TYPE_CERT' => 0,
+	'TYPE_CRL' => 1,
+};
+
+# Nagios return values
+use constant {
+	'OK' => 0,
+	'WARNING' => 1,
+	'CRITICAL' => 2,
+	'UNKNOWN' => 3,
+	'DEPENDENT' => 4,
+};
+# For reverse reference
+use constant STATUS_NAMES => qw(OK WARNING CRITICAL UNKNOWN DEPENDENT);
+
+# Defaults
+use constant {
+	'DEFAULT_WARN' => '4w',
+	'DEFAULT_CRIT' => '1w',
+	'DEFAULT_CERT_FORMAT' => FORMAT_PEM,
+	'DEFAULT_CRL_FORMAT' => FORMAT_PEM,
+};
+
+# Internal constants
+use constant {
+	'CERT_BEGIN' => '-----BEGIN CERTIFICATE-----',
+	'CERT_END' => '-----END CERTIFICATE-----',
+	'CRL_BEGIN' => '-----BEGIN X509 CRL-----',
+	'CRL_END' => '-----END X509 CRL-----',
+};
+
+# The two globals
+my ($DEBUG,$VERBOSE) = (0,0);
+
+# --------------
+# SUBS
+# --------------
+
+#
+# Print verbose messages
+#
+sub verbose($)
+{
+	my $msg = shift;
+	if ($VERBOSE) {
+		print $msg;
+	}
+}
+
+#
+# Print debug messages
+#
+sub debug($)
+{
+	my $msg = shift;
+	if ($DEBUG) {
+		print STDERR "DEBUG: $msg\n";
+	}
+}
+
+#
+# How long between now and X?
+#
+sub get_delta($)
+{
+	my $t = shift;
+	return now() - $t;
+}
+
+#
+# Convert time from Crypt::OpenSSL::X509 into epoch
+#
+sub x5092time($)
+{
+	my $time = shift;
+	$time =~ m/(\w+) (\d\d) (\d\d:\d\d:\d\d) (\d{4}) GMT/;
+	my $tmp = "$4-" . MONTHS->{$1} . "-$2 $3";
+	my $t = str2time($tmp);
+	return $t;
+}
+
+#
+# Read in user input and convert to our constants
+#
+sub format2int($)
+{
+	my $format = shift;
+
+	if ($format =~ m/pem/i) {
+		return FORMAT_PEM;
+	} elsif ($format =~ m/der/i) {
+		return FORMAT_DER;
+	} elsif ($format =~ m/bundle/i) {
+		return FORMAT_BUNDLE;
+	} else {
+		return FORMAT_PEM;
+	}
+}
+
+#
+# Convert <digit>(m|h|d|y) into epoch
+#
+sub user2time($)
+{
+	my $time = shift;
+	unless ($time =~ m/^(\d+)(m|h|d|w|y)$/) {
+		return undef;
+	}
+	my ($num,$unit) = ($1,$2);
+
+	return $num * MULTIPLIERS->{$unit};
+}
+
+#
+# Is this crit, warn, or OK?
+#
+sub get_alert_level($$$)
+{
+	my ($config,$obj,$time) = @_;
+	my $diff = $time - time();
+	verbose(":\t" . gmtime($time) . " GMT");
+
+	my $crit = $config->{'crit'};
+	my $warn = $config->{'warn'};
+
+	if (exists($obj->{'crit'})) {
+		debug('using object-specific crit ' . $obj->{'crit'});
+		$crit = $obj->{'crit'};
+	}
+	if (exists($obj->{'warn'})) {
+		debug('using object-specific warn ' . $obj->{'warn'});
+		$warn = $obj->{'warn'};
+	}
+
+	if ($diff <= user2time($crit)) {
+		verbose(" (CRIT: less than $crit)\n");
+		return CRITICAL;
+	} elsif ($diff <= user2time($warn)) {
+		verbose(" (WARN: less than $warn)\n");
+		return WARNING;
+	} else {
+		verbose(" (OK: more than $warn)\n");
+		return OK;
+	}
+}
+
+#
+# The main workhorse
+#
+sub check_object($$$)
+{
+	my ($config,$obj,$type) = @_;
+
+	#
+	# Figure out what format we're pulling in...
+	#
+	my $format = '';
+	if (exists($obj->{'format'})) {
+		$format = format2int($obj->{'format'});
+	} else {
+		if ($type == TYPE_CERT) {
+			$format = $config->{'cert-format'};
+		} elsif ($type == TYPE_CRL) {
+			$format = $config->{'crl-format'};
+		} else {
+			exit_unknown("Unknown type '$type' specified");
+		}
+	}
+
+	my $typename = ($type) ? 'CRL' : 'CERTIFICATE';
+	my $name = basename($obj->{'name'});
+	my $datas = [];
+	if ($format == FORMAT_PEM) {
+		debug("parsing $name as PEM");
+		my $ssl = new OpenCA::OpenSSL;
+		my $der = $ssl->dataConvert(INFILE => $obj->{'name'},
+			DATATYPE => $typename, INFORM => 'PEM',
+			OUTFORM => 'DER')
+			|| exit_unknown('Couldn\'t convert PEM to '
+				. ' DER (' . $obj->{'name'} . ')');
+		push(@{$datas},$der);
+	} elsif ($format == FORMAT_DER) {
+		debug("parsing $name as DER");
+		open(MYCRT,'<' . $obj->{'name'}) || return(UNKNOWN,$name);
+		my $der = join('',<MYCRT>);
+		close(MYCRT);
+		push(@{$datas},$der);
+	} elsif ($format == FORMAT_BUNDLE) {
+		push(@{$datas},@{extract_bundle($obj,$type)});
+	} else {
+		exit_unknown("Unknown format for cert: $format");
+	}
+	my $level = OK;
+	my $count = 0;
+	foreach my $data (@{$datas}) {
+		my $crypt;
+		if ($type == TYPE_CERT) {
+			$crypt = Crypt::X509->new(cert => $data);
+		} else {
+			$crypt = Crypt::X509::CRL->new(crl => $data);
+		}
+		if ($crypt->error) {
+			exit_unknown("Couldn\'t decode $name: " . $crypt->error);
+		}
+		verbose($name);
+		verbose("(" . $count++ . ")") if ($format == FORMAT_BUNDLE);
+		my $date = ($type) ? $crypt->next_update() : $crypt->not_after();
+		my $llevel = get_alert_level($config,$obj,$date);
+		if ($llevel > $level) {
+			$level = $llevel;
+		}
+	}
+	return ($level,$name);
+}
+
+#
+# Figure out what our worst status is
+#
+sub get_exit_status($)
+{
+	my $status = shift;
+	if (exists($status->{CRITICAL()})) {
+		debug('Aggregate status: crit');
+		status_info($status,CRITICAL);
+		return CRITICAL;
+	} elsif (exists($status->{WARNING()})) {
+		debug('Aggregate status: warn');
+		status_info($status,WARNING);
+		return WARNING;
+	} elsif (scalar(keys(%{$status})) == 0) {
+		debug('Aggregate status: ok');
+		print "OK!\n";
+		return OK;
+	} else {
+		debug('Aggregate status: unknown');
+		print "There are certs in some strange status...\n";
+		return UNKNOWN;
+	}
+}
+
+#
+# Print the info for the status we'll be exiting with
+#
+sub status_info($$)
+{
+	my ($status,$level) = @_;
+
+	print uc((STATUS_NAMES)[$level]) . ': ';
+	print shift(@{$status->{$level}});
+	foreach my $name (@{$status->{$level}}) {
+		print ", $name";
+	}
+	print "\n";
+}
+
+#
+# Take in a config file and command line options
+# and merge them into a config
+#
+sub gen_config($)
+{
+	my $opt = shift;
+
+	my $conffile;
+	if (exists($opt->{'config'})) {
+		$conffile = $opt->{'config'};
+		unless (-r $conffile) {
+			exit_unknown("Config file $conffile not readable!\n");
+		}
+	} else {
+		$conffile = DEFAULT_CONFIG;
+	}
+
+	my $config = {};
+	if (-r $conffile) {
+		$config = YAML::Syck::LoadFile($conffile);
+	}
+
+	# For each of our configs, if there's a command
+	# line option we use it. If not, we use what we
+	# just got from the file. If not, we use the default
+
+	if (exists($opt->{'warn'})) {
+		$config->{'warn'} = $opt->{'warn'};
+	} elsif (!exists($config->{'warn'})) {
+		$config->{'warn'} = DEFAULT_WARN;
+	}
+
+	if (exists($opt->{'crit'})) {
+		$config->{'crit'} = $opt->{'crit'};
+	} elsif (!exists($config->{'crit'})) {
+		$config->{'crit'} = DEFAULT_CRIT;
+	}
+
+	debug("GLOBAL: warn: $config->{'warn'}, crit: $config->{'crit'}");
+
+	if (exists($opt->{'cert-format'})) {
+		$config->{'cert-format'} = format2int($opt->{'cert-format'});
+	} elsif (!exists($config->{'cert-format'})) {
+		$config->{'cert-format'} = DEFAULT_CERT_FORMAT;
+	}
+
+	if (exists($opt->{'crl-format'})) {
+		$config->{'crl-format'} = format2int($opt->{'crl-format'});
+	} elsif (!exists($config->{'crl-format'})) {
+		$config->{'crl-format'} = DEFAULT_CRL_FORMAT;
+	}
+
+	debug("crlformat: $config->{'crl-format'}");
+
+	unless (user2time($config->{'crit'}) < user2time($config->{'warn'})) {
+		exit_unknown('Config Error: Critical most be less than warning');
+	}
+
+	#
+	# For the list of things to check, there is no default. First
+	# we override any config file lists with the command line...
+	#
+	if (exists($opt->{'cert'})) {
+		$config->{'certs'} = [];
+		foreach my $name (@{$opt->{'cert'}}) {
+			push(@{$config->{'certs'}},{'name' => $name});
+		}
+	}
+
+	if (exists($opt->{'crl'})) {
+		$config->{'crls'} = [];
+		foreach my $name (@{$opt->{'crl'}}) {
+			push(@{$config->{'crls'}},{'name' => $name});
+		}
+	}
+
+	#
+	# .. and then we make sure we actually have something to check!
+	#
+	unless (exists($config->{'certs'}) || exists($config->{'crls'})) {
+		exit_unknown('Config error: No certs or CRLs to check!');
+	}
+	
+	$config->{'certs'} = [] unless (exists($config->{'certs'}));
+	$config->{'crls'} = [] unless (exists($config->{'crls'}));
+
+	my $error = '';
+	foreach my $obj (@{$config->{'certs'}}, @{$config->{'crls'}}) {
+		unless (-r $obj->{'name'}) {
+			$error .= $obj->{'name'} . ' does not exist or is not'
+				. " readable\n";
+		}
+		if (exists($obj->{'warn'}) || exists($obj->{'crit'})) {
+			unless (exists($obj->{'warn'})
+					&& exists($obj->{'crit'})) {
+				$error .= 'One of warn/crit specified but not'
+					. ' the other for ' . $obj->{'name'}
+					. '. If you use one, you must use the'
+					. " other.\n"; 
+			} else {
+				unless (user2time($obj->{'crit'})
+						< user2time($obj->{'warn'})) {
+					$error .= 'Critical must be less than'
+						. ' warning, but isn\'t on '
+						. $obj->{'name'} . "\n";
+				}
+			}
+		}
+	}
+
+	if ($error) {
+		exit_unknown("Config errors: $error");
+	}
+
+	return $config;
+}
+
+sub extract_bundle($$)
+{
+	my ($obj,$type) = @_;
+
+	debug('Parsing ' . $obj->{'name'} . ' as bundle');
+
+	my $ssl = new OpenCA::OpenSSL;
+	my $typename = ($type) ? 'CRL' : 'CERTIFICATE';
+
+	my ($begin,$end) = ('','');
+	if ($type == TYPE_CERT) {
+		$begin = CERT_BEGIN;
+		$end = CERT_END;
+	} elsif ($type == TYPE_CRL) {
+		$begin = CRL_BEGIN;
+		$end = CRL_END;
+	} else {
+		exit_unknown("Couldn't interpret type: $type");
+	}
+
+	open(FH,'<' . $obj->{'name'})
+		|| exit_unknown('Can\'t open ' . $obj->{'name'});
+	my $single_obj = '';
+	my $incert = 0;
+	my @datas = ();
+	my $numcerts = 0;
+	while (my $line = <FH>) {
+		if ($line eq "$end\n" && $incert) {
+			$single_obj .= $line;
+			debug("BUNDLE: Found: $single_obj");
+			my $data = $ssl->dataConvert(DATA => $single_obj,
+				DATATYPE => $typename, INFORM => 'PEM',
+				OUTFORM => 'DER')
+				|| exit_unknown('Couldn\'t convert PEM to '
+					. ' DER (' . $obj->{'name'} . '): '
+					. $ssl->errval);
+			push(@datas,$data);
+			$numcerts++;
+			$single_obj = '';
+			$incert = 0;
+		} elsif ($line eq "$begin\n" && ! $incert) {
+			$incert = 1;
+			$single_obj = $line;
+		} elsif ($incert) {
+			$single_obj .= $line;
+		} else {
+			next;
+		}
+	}
+	close(FH) || exit_unknown('Can\'t close ' . $obj->{'name'});
+
+	if ($numcerts == 0) {
+		exit_unknown('Bundle Empty: ' . $obj->{'name'});
+	}
+
+	return \@datas;
+}
+
+sub exit_unknown($)
+{
+	my $msg = shift;
+
+	chomp($msg);
+	print 'UNKNOWN: ' . $msg . "\n";
+	exit UNKNOWN;
+}
+
+sub help
+{
+
+	print NAME . ' ' . VERSION . ' by Phil Dibowitz <phil@ipom.com>' . "\n";
+	print <<EOF
+
+This is a generic plugin to do expiration testing on x509 objects.
+
+Usage: $0 [<options>]
+
+Options:
+	--config <file>
+	  Path to a config file.
+	  (default: /etc/check_x509.conf)
+
+	--cert, --certificate <certificate>
+	  A path to a certificate in PEM format. Can be specified
+	  multiples times. There is no default for this option, it must be
+	  specified either in the config file, or on the command line.
+
+	--cert-format <PEM|DER>
+	  Specify the format of certificates.
+	  This is a global setting.
+	  (default: PEM)
+
+	-c, --crit, --critical <num><h|d|w|m|y>
+	  Critical when <num> hours/days/weeks/months/years until expiration.
+	  This is the global setting.
+	  (default: 1w)
+
+	--crl, --revocation <crl>
+	  A path to a CRL in DER format. Can be specified multiple
+	  times. There is no default for this option, it must be specified
+	  either in the config file, or on the command line.
+
+	--crl-format <PEM|DER>
+	  Specify the format of CRLs.
+	  This is a global setting.
+	  (default: PEM)
+
+	-d, --debug
+	  Enable debug output.
+
+	-h, --help
+	  This output.
+
+	-w, --warn, --warning <num><h|d|w|m|y>
+	  Warn when <num> hours/days/weeks/months/years until expiration.
+	  This is the global setting.
+	  (default: 1m)
+
+	-v, --verbose
+	  Enable verbose output. This will list the expration date
+	  of each
+
+	--version
+	  Print version.
+	
+EOF
+;
+}
+
+#
+# Main
+#
+my $opt = {};
+GetOptions(	$opt,
+		'config=s',
+		'cert|certificate=s@',
+		'crit|critical|c=s',
+		'crl|revocation=s@',
+		'cert-format=s',
+		'crl-format=s',
+		'debug|d',
+		'help|h',
+		'warn|warning|w=s',
+		'verbose|v',
+		'version',
+) || die('bad options');
+
+if (exists($opt->{'help'})) {
+	help();
+	exit 0;
+}
+
+if (exists($opt->{'version'})) {
+	print NAME . ' ' . VERSION . ' by Phil Dibowitz <phil@ipom.com>' . "\n";
+	exit 0;
+}
+
+$DEBUG = 1 if (exists($opt->{'debug'}));
+$VERBOSE = 1 if (exists($opt->{'verbose'}));
+
+my $config = gen_config($opt);
+
+my $status = {};
+foreach my $cert (@{$config->{'certs'}}) {
+	my ($level,$name) = check_object($config,$cert,TYPE_CERT);
+	next if ($level == OK);
+	unless (exists($status->{$level})) {
+		$status->{$level} = [];
+	}
+	push(@{$status->{$level}},$name);
+}
+
+foreach my $crl (@{$config->{'crls'}}) {
+	my ($level,$name) = check_object($config,$crl,TYPE_CRL);
+	next if ($level == OK);
+	unless (exists($status->{$level})) {
+		$status->{$level} = [];
+	}
+	push(@{$status->{$level}},$name);
+}
+
+exit get_exit_status($status);
+
+=pod
+
+=head1 NAME
+
+check_x509 - Generic X509 entity check utility.
+
+=head1 SYNOPSYS
+
+check_x509 [<B<options>>]
+
+=head1 DESCRIPTION
+
+check_x509 is a generic script to check X509 entities for expiration periods.
+It can be run from nagios, nrpe, cron, on the command line, or in other
+scripts or programs.
+
+=head1 OPTIONS
+
+=over 4
+
+=item B<--config> I<file>
+
+Path to a config file.
+(default: /etc/check_x509.conf)
+
+=item B<--cert, --certificate> I<certificate>
+
+A path to a certificate in PEM format. Can be specified
+multiples times. There is no default for this option, it must be
+specified either in the config file, or on the command line.
+
+=item B<--cert-format> I<PEM|DER>
+
+Specify the format of certificates.
+This is a global setting.
+(default: PEM)
+
+=item B<-c, --crit, --critical> I<num(h|d|w|m|y)>
+
+Critical when <num> hours/days/weeks/months/years until expiration.
+This is the global setting.
+(default: 1w)
+
+=item B<--crl, --revocation> I<crl>
+
+A path to a CRL in DER format. Can be specified multiple
+times. There is no default for this option, it must be specified
+either in the config file, or on the command line.
+
+=item B<--crl-format> I<PEM|DER>
+
+Specify the format of CRLs.
+This is a global setting.
+(default: PEM)
+
+=item B<-d, --debug>
+
+Enable debug output.
+
+=item B<-h, --help>
+
+This output.
+
+=item B<-w, --warn, --warning> I<num(h|d|w|m|y)>
+
+Warn when <num> hours/days/weeks/months/years until expiration.
+This is the global setting.
+(default: 1m)
+
+=item B<-v, --verbose>
+
+Enable verbose output. This will list the expration date of each.
+
+=item B<--version>
+
+Print version.
+
+=back
+
+=head1 EXIT STATUS
+
+Exit status is consistent with nagios plugins:
+
+=over 4
+
+=item 0 B<OK>
+
+=item 1 B<WARNING>
+
+=item 2 B<CRITICAL>
+
+=item 3 B<UNKNOWN>
+
+=item 4 B<DEPENDENT>
+
+=back
+
+Note that check_x509 never uses 'dependent.
+
+=head1 NOTES
+
+check_x509's configuration file is YAML. It's easy to write, see the examples
+in the distribution. Note that command line options override that config in
+the configuration file. That means if you pass in --cert, only certificates
+passed on the command line will be checked. However, any CRLs in your
+configuration file will still be checked.
+
+There is currently no way to pass in per-entity thresholds on the command line
+like you can in the config file.
+
+=head1 AUTHOR
+
+check_x509 was written by Phil Dibowitz <phil@ipom.com>
+http://www.phildev.net/check_x509/
+
+=cut
+
