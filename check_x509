@@ -19,6 +19,8 @@
 # $Id$
 #
 
+# test
+
 use strict;
 use warnings;
 use Getopt::Long;
@@ -31,7 +33,7 @@ use YAML::Syck;
 use Data::Dumper;
 
 use constant NAME => 'check_x509';
-use constant VERSION => '0.1';
+use constant VERSION => '1.0';
 use constant DEFAULT_CONFIG => '/etc/check_x509.conf';
 use constant MONTHS => {
 	'Jan' => '01',
