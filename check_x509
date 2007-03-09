@@ -215,9 +215,9 @@ sub get_alert_level($$$)
 #
 # The main workhorse
 #
-sub check_object($$$)
+sub check_object($$)
 {
-	my ($config,$obj,$type) = @_;
+	my ($config,$obj) = @_;
 
 	#
 	# Figure out what format we're pulling in...
@@ -226,16 +226,17 @@ sub check_object($$$)
 	if (exists($obj->{'format'})) {
 		$format = format2int($obj->{'format'});
 	} else {
-		if ($type == TYPE_CERT) {
+		if ($obj->{'type'} == TYPE_CERT) {
 			$format = $config->{'cert-format'};
-		} elsif ($type == TYPE_CRL) {
+		} elsif ($obj->{'type'} == TYPE_CRL) {
 			$format = $config->{'crl-format'};
 		} else {
-			exit_unknown("Unknown type '$type' specified");
+			exit_unknown('Unknown type ' . $obj->{'type'}
+				. ' specified');
 		}
 	}
 
-	my $typename = ($type) ? 'CRL' : 'CERTIFICATE';
+	my $typename = ($obj->{'type'}) ? 'CRL' : 'CERTIFICATE';
 	my $name = basename($obj->{'name'});
 	my $datas = [];
 	if ($format == FORMAT_PEM) {
@@ -254,7 +255,7 @@ sub check_object($$$)
 		close(MYCRT);
 		push(@{$datas},$der);
 	} elsif ($format == FORMAT_BUNDLE) {
-		push(@{$datas},@{extract_bundle($obj,$type)});
+		push(@{$datas},@{extract_bundle($obj)});
 	} else {
 		exit_unknown("Unknown format for cert: $format");
 	}
@@ -262,7 +263,7 @@ sub check_object($$$)
 	my $count = 0;
 	foreach my $data (@{$datas}) {
 		my $crypt;
-		if ($type == TYPE_CERT) {
+		if ($obj->{'type'} == TYPE_CERT) {
 			$crypt = Crypt::X509->new(cert => $data);
 		} else {
 			$crypt = Crypt::X509::CRL->new(crl => $data);
@@ -272,7 +273,7 @@ sub check_object($$$)
 		}
 		verbose($name);
 		verbose("(" . $count++ . ")") if ($format == FORMAT_BUNDLE);
-		my $date = ($type) ? $crypt->next_update() : $crypt->not_after();
+		my $date = ($obj->{'type'}) ? $crypt->next_update() : $crypt->not_after();
 		my $llevel = get_alert_level($config,$obj,$date);
 		if ($llevel > $level) {
 			$level = $llevel;
@@ -384,32 +385,33 @@ sub gen_config($)
 	# For the list of things to check, there is no default. First
 	# we override any config file lists with the command line...
 	#
-	if (exists($opt->{'cert'})) {
-		$config->{'certs'} = [];
-		foreach my $name (@{$opt->{'cert'}}) {
-			push(@{$config->{'certs'}},{'name' => $name});
+	if (exists($opt->{'cert'}) || exists($opt->{'crl'})) {
+		$config->{'entities'} = [];
+		if (exists($opt->{'cert'})) {
+			foreach my $name (@{$opt->{'cert'}}) {
+				push(@{$config->{'entities'}},
+						{'name' => $name,
+						 'type' => 'cert'});
+			}
 		}
-	}
-
-	if (exists($opt->{'crl'})) {
-		$config->{'crls'} = [];
-		foreach my $name (@{$opt->{'crl'}}) {
-			push(@{$config->{'crls'}},{'name' => $name});
+		if (exists($opt->{'crl'})) {
+			foreach my $name (@{$opt->{'crl'}}) {
+				push(@{$config->{'entities'}},
+						{'name' => $name,
+						 'type' => 'crl'});
+			}
 		}
 	}
 
 	#
 	# .. and then we make sure we actually have something to check!
 	#
-	unless (exists($config->{'certs'}) || exists($config->{'crls'})) {
-		exit_unknown('Config error: No certs or CRLs to check!');
+	unless (scalar($config->{'entities'}) > 0) {
+		exit_unknown('Config error: No entities to check!');
 	}
 	
-	$config->{'certs'} = [] unless (exists($config->{'certs'}));
-	$config->{'crls'} = [] unless (exists($config->{'crls'}));
-
 	my $error = '';
-	foreach my $obj (@{$config->{'certs'}}, @{$config->{'crls'}}) {
+	foreach my $obj (@{$config->{'entities'}}) {
 		unless (-r $obj->{'name'}) {
 			$error .= $obj->{'name'} . ' does not exist or is not'
 				. " readable\n";
@@ -430,33 +432,43 @@ sub gen_config($)
 				}
 			}
 		}
+		if ($obj->{'type'} eq 'cert') {
+			$obj->{'type'} = TYPE_CERT;
+		} elsif ($obj->{'type'} eq 'crl') {
+			$obj->{'type'} = TYPE_CRL;
+		} else {
+			$error .= 'Unknown type (' . $obj->{'type'}
+				. ') for ' . $obj->{'name'} . "\n";
+		}
 	}
 
 	if ($error) {
 		exit_unknown("Config errors: $error");
 	}
 
+	debug(Dumper($config));
+
 	return $config;
 }
 
-sub extract_bundle($$)
+sub extract_bundle($)
 {
-	my ($obj,$type) = @_;
+	my ($obj) = @_;
 
 	debug('Parsing ' . $obj->{'name'} . ' as bundle');
 
 	my $ssl = new OpenCA::OpenSSL;
-	my $typename = ($type) ? 'CRL' : 'CERTIFICATE';
+	my $typename = ($obj->{'type'}) ? 'CRL' : 'CERTIFICATE';
 
 	my ($begin,$end) = ('','');
-	if ($type == TYPE_CERT) {
+	if ($obj->{'type'} == TYPE_CERT) {
 		$begin = CERT_BEGIN;
 		$end = CERT_END;
-	} elsif ($type == TYPE_CRL) {
+	} elsif ($obj->{'type'} == TYPE_CRL) {
 		$begin = CRL_BEGIN;
 		$end = CRL_END;
 	} else {
-		exit_unknown("Couldn't interpret type: $type");
+		exit_unknown('Couldn\'t interpret type: ' . $obj->{'type'});
 	}
 
 	open(FH,'<' . $obj->{'name'})
@@ -602,8 +614,8 @@ $VERBOSE = 1 if (exists($opt->{'verbose'}));
 my $config = gen_config($opt);
 
 my $status = {};
-foreach my $cert (@{$config->{'certs'}}) {
-	my ($level,$name) = check_object($config,$cert,TYPE_CERT);
+foreach my $obj (@{$config->{'entities'}}) {
+	my ($level,$name) = check_object($config,$obj);
 	next if ($level == OK);
 	unless (exists($status->{$level})) {
 		$status->{$level} = [];
@@ -611,14 +623,14 @@ foreach my $cert (@{$config->{'certs'}}) {
 	push(@{$status->{$level}},$name);
 }
 
-foreach my $crl (@{$config->{'crls'}}) {
-	my ($level,$name) = check_object($config,$crl,TYPE_CRL);
-	next if ($level == OK);
-	unless (exists($status->{$level})) {
-		$status->{$level} = [];
-	}
-	push(@{$status->{$level}},$name);
-}
+#foreach my $crl (@{$config->{'crls'}}) {
+#	my ($level,$name) = check_object($config,$crl,TYPE_CRL);
+#	next if ($level == OK);
+#	unless (exists($status->{$level})) {
+#		$status->{$level} = [];
+#	}
+#	push(@{$status->{$level}},$name);
+#}
 
 exit get_exit_status($status);
 
@@ -725,9 +737,8 @@ Note that check_x509 never uses 'dependent.
 
 check_x509's configuration file is YAML. It's easy to write, see the examples
 in the distribution. Note that command line options override that config in
-the configuration file. That means if you pass in --cert, only certificates
-passed on the command line will be checked. However, any CRLs in your
-configuration file will still be checked.
+the configuration file. That means passing in --cert or --crl will override
+the entire 'entities' array in the configuration file.
 
 There is currently no way to pass in per-entity thresholds on the command line
 like you can in the config file.
