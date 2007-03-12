@@ -14,6 +14,7 @@ License: GPLv2
 URL: http://www.phildev.net/check_x509/
 BuildRoot: %{_tmppath}/%{name}-buildroot
 Requires: perl
+Requires: perl(OpenCA::OpenSSL), perl(Crypt::X509), perl(Crypt::X509::CRL)
 
 %description
  check_x509 is a generic utility for checking X509 entities. It
@@ -35,5 +36,5 @@ rm -rf $RPM_BUILD_ROOT
 %defattr(755, root, bin, 755)
 /usr/bin/%{name}
 /usr/man/man1/%{name}.1*
-%doc README COPYING
+%doc README COPYING examples/check_x509.conf
 

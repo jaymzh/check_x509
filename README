@@ -61,3 +61,5 @@ whole. In verbose mode, the expiration for each object in the bundle will be
 printed, but only the most sever status is actually used.
 
 
+- Phil Dibowitz <phil@ipom.com>
+http://www.phildev.net/check_x509/

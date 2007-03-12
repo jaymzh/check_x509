@@ -406,7 +406,8 @@ sub gen_config($)
 	#
 	# .. and then we make sure we actually have something to check!
 	#
-	unless (scalar($config->{'entities'}) > 0) {
+	unless (exists($config->{'entities'})
+			&& scalar($config->{'entities'}) > 0) {
 		exit_unknown('Config error: No entities to check!');
 	}
 	
