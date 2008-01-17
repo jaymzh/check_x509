@@ -345,6 +345,10 @@ sub gen_config($)
 		$config = YAML::Syck::LoadFile($conffile);
 	}
 
+	unless(defined($config)) {
+		exit_ok("No config file, nothing to check");
+	}
+
 	# For each of our configs, if there's a command
 	# line option we use it. If not, we use what we
 	# just got from the file. If not, we use the default
